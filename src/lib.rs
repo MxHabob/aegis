@@ -7,6 +7,7 @@ pub mod modules;
 pub mod output;
 pub mod scope;
 pub mod storage;
+pub mod transport;
 
 pub use app::AppContext;
 pub use core::models::{AppState, Asset, Finding, Scope, Severity};

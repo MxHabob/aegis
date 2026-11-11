@@ -1,5 +1,4 @@
-use anyhow::{Context, Result, bail};
-use assetctl::{
+use aegis::{
     AppContext,
     connectors::{InventorySource, JsonFileSource},
     core::models::Finding,
@@ -7,6 +6,7 @@ use assetctl::{
     modules::default_modules,
     output::{render_json_report, render_text_report},
 };
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
@@ -15,13 +15,15 @@ mod ui;
 
 #[derive(Parser)]
 #[command(
-    name = "assetctl",
+    name = "aegis",
     version,
-    about = "Local-first authorized asset inventory"
+    about = "Modular cybersecurity operations workbench"
 )]
 struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     data_dir: Option<PathBuf>,
+    #[arg(long, global = true, default_value_t = 20, value_name = "SECONDS")]
+    timeout_seconds: u64,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -61,6 +63,15 @@ enum Command {
         #[command(subcommand)]
         command: SshCommand,
     },
+    ImportUrl {
+        url: String,
+        #[arg(long, default_value = "default")]
+        group: String,
+    },
+    Transport {
+        #[command(subcommand)]
+        command: TransportCommand,
+    },
     Camera {
         #[command(subcommand)]
         command: CameraCommand,
@@ -72,6 +83,24 @@ enum CameraCommand {
     List {
         #[arg(long)]
         group: Option<String>,
+    },
+    Add {
+        host: String,
+        label: String,
+        #[arg(long, default_value = "default")]
+        group: String,
+        #[arg(long = "protocol")]
+        protocols: Vec<String>,
+    },
+    Remove {
+        host: String,
+        #[arg(long, default_value = "default")]
+        group: String,
+    },
+    Show {
+        host: String,
+        #[arg(long, default_value = "default")]
+        group: String,
     },
 }
 
@@ -93,6 +122,11 @@ enum MapCommand {
 #[derive(Subcommand)]
 enum SshCommand {
     AuditConfig { path: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum TransportCommand {
+    Diagnostics,
 }
 
 #[derive(Subcommand)]
@@ -174,34 +208,41 @@ struct FormatArgs {
     format: String,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).ok();
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Menu);
     let data_dir = cli.data_dir.unwrap_or_else(default_data_dir);
-    let mut app = AppContext::open(data_dir)?;
+    if cli.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be greater than zero");
+    }
+    let timeout = std::time::Duration::from_secs(cli.timeout_seconds);
+    let mut app = AppContext::open_with_timeout(data_dir, timeout)?;
 
     if !matches!(&command, Command::Menu) && !is_machine_output(&command) {
-        ui::print_banner(app.state(), false);
+        ui::print_banner(&app, false, timeout)?;
     }
 
     match command {
-        Command::Menu => menu(&mut app),
+        Command::Menu => menu(&mut app, timeout).await,
         Command::Modules => {
-            println!("Built-in modules:");
-            println!("  scope       Manage explicitly authorized domains and IPs");
-            println!("  inventory   Track assets entered by the operator");
-            println!("  camera      Browse camera records from imported authorized inventory");
-            println!("  ssh         Audit a locally supplied sshd_config file");
-            println!("  map         Save, list, and open local map snapshots");
+            println!("AEGIS cybersecurity modules:");
+            println!("  attack surface   Manage authorized scope and local asset intelligence");
+            println!("  infrastructure   Review local SSH configuration and transport status");
+            println!("  IoT inventory    Manage camera records and protocol metadata");
+            println!("  operations       Import, search, archive, report, and audit local data");
             for module in default_modules() {
                 println!("  {:<12} {}", module.name(), module.description());
             }
             println!("  report      Export local inventory and consistency findings");
             println!(
-                "No network scanning, device login, exploitation, or stealth actions are implemented."
+                "The module catalog reports current behavior; new security domains can be added independently."
+            );
+            println!(
+                "Expansion domains: application security, cloud security, incident response, forensics, and detection engineering."
             );
             Ok(())
         }
@@ -410,7 +451,7 @@ fn main() -> Result<()> {
         },
         Command::Ssh { command } => match command {
             SshCommand::AuditConfig { path } => {
-                let findings = assetctl::modules::ssh_config::audit_sshd_config(&path)?;
+                let findings = aegis::modules::ssh_config::audit_sshd_config(&path)?;
                 print_ssh_findings(&findings);
                 Ok(())
             }
@@ -424,6 +465,65 @@ fn main() -> Result<()> {
                 };
                 let cameras = filter_assets(&app.state().assets, &filters);
                 print_camera_inventory(&cameras);
+                Ok(())
+            }
+            CameraCommand::Add {
+                host,
+                label,
+                group,
+                protocols,
+            } => {
+                app.add_camera_asset(&host, &label, &group, &protocols)?;
+                println!("Added camera inventory record for {host} in {group}.");
+                Ok(())
+            }
+            CameraCommand::Remove { host, group } => {
+                let is_camera = app.state().assets.iter().any(|asset| {
+                    asset.host.eq_ignore_ascii_case(&host)
+                        && asset.group.eq_ignore_ascii_case(&group)
+                        && asset.asset_type == "camera"
+                });
+                if !is_camera {
+                    bail!("camera {host} was not found in group {group}");
+                }
+                app.remove_asset(&host, &group)?;
+                println!("Removed camera inventory record for {host} from {group}.");
+                Ok(())
+            }
+            CameraCommand::Show { host, group } => {
+                let camera = app.state().assets.iter().find(|asset| {
+                    asset.host.eq_ignore_ascii_case(&host)
+                        && asset.group.eq_ignore_ascii_case(&group)
+                        && asset.asset_type == "camera"
+                });
+                let camera = camera
+                    .with_context(|| format!("camera {host} was not found in group {group}"))?;
+                print_camera_details(camera);
+                Ok(())
+            }
+        },
+        Command::ImportUrl { url, group } => {
+            let count = app.import_remote_inventory(&url, &group).await?;
+            println!("Imported {count} assets from authorized HTTPS inventory endpoint.");
+            Ok(())
+        }
+        Command::Transport { command } => match command {
+            TransportCommand::Diagnostics => {
+                let diagnostic =
+                    aegis::transport::diagnose_os_vpn(std::time::Duration::from_secs(3));
+                println!("Transport: HTTPS using OS-managed network routing");
+                println!("Connection timeout: {} seconds", cli.timeout_seconds);
+                println!("Tor transport: not enabled");
+                println!("VPN interface query supported: {}", diagnostic.supported);
+                if diagnostic.likely_interfaces.is_empty() {
+                    println!("Likely VPN interfaces: none detected");
+                } else {
+                    println!("Likely VPN interfaces:");
+                    for interface in diagnostic.likely_interfaces {
+                        println!("  {interface}");
+                    }
+                }
+                println!("Note: {}", diagnostic.note);
                 Ok(())
             }
         },
@@ -462,11 +562,7 @@ fn search_filters(args: &SearchArgs) -> AssetFilters<'_> {
     }
 }
 
-fn print_findings(
-    args: FormatArgs,
-    state: &assetctl::AppState,
-    findings: &[Finding],
-) -> Result<()> {
+fn print_findings(args: FormatArgs, state: &aegis::AppState, findings: &[Finding]) -> Result<()> {
     let output = if args.format == "json" {
         render_json_report(state, findings)?
     } else {
@@ -487,24 +583,25 @@ fn is_machine_output(command: &Command) -> bool {
     )
 }
 
-fn menu(app: &mut AppContext) -> Result<()> {
-    const MAP: &str = "Digital asset map";
-    const CAMERAS: &str = "Camera inventory";
-    const SSH: &str = "SSH configuration audit";
-    const ARCHIVES: &str = "Saved maps and archives";
-    const SCOPES: &str = "Scopes and groups";
-    const ASSETS: &str = "Inventory management";
-    const REPORTS: &str = "Reports and local checks";
-    const AUDIT: &str = "Audit history";
-    const MODULES: &str = "Available modules";
+async fn menu(app: &mut AppContext, timeout: std::time::Duration) -> Result<()> {
+    const MAP: &str = "Attack Surface Intelligence";
+    const CAMERAS: &str = "IoT and Camera Inventory";
+    const SSH: &str = "Infrastructure Security Review";
+    const TRANSPORT: &str = "Network Transport Diagnostics";
+    const ARCHIVES: &str = "Evidence and Map Archives";
+    const SCOPES: &str = "Engagement Scope and Groups";
+    const ASSETS: &str = "Security Data Management";
+    const REPORTS: &str = "Security Posture and Reporting";
+    const AUDIT: &str = "Activity Audit Trail";
+    const MODULES: &str = "Capability Catalog";
     const EXIT: &str = "Exit";
 
     let actions = vec![
-        MAP, CAMERAS, SSH, ARCHIVES, SCOPES, ASSETS, REPORTS, AUDIT, MODULES, EXIT,
+        MAP, CAMERAS, SSH, TRANSPORT, ARCHIVES, SCOPES, ASSETS, REPORTS, AUDIT, MODULES, EXIT,
     ];
 
     loop {
-        ui::print_banner(app.state(), true);
+        ui::print_banner(app, true, timeout)?;
         let selected = match ui::prompt_select(
             "What would you like to do?",
             actions.iter().map(|action| (*action).to_owned()).collect(),
@@ -524,9 +621,10 @@ fn menu(app: &mut AppContext) -> Result<()> {
         }
 
         let result = match selected.as_str() {
-            MAP => menu_digital_map(app),
+            MAP => menu_digital_map(app).await,
             CAMERAS => menu_camera_inventory(app),
             SSH => menu_ssh_audit(),
+            TRANSPORT => menu_transport_diagnostics(),
             ARCHIVES => menu_archives(app),
             SCOPES => menu_scope_group(app),
             ASSETS => menu_inventory_management(app),
@@ -557,10 +655,11 @@ fn choose_action(message: &str, actions: &[&str]) -> Result<String> {
     Ok(ui::prompt_select(message, options)?)
 }
 
-fn menu_digital_map(app: &mut AppContext) -> Result<()> {
+async fn menu_digital_map(app: &mut AppContext) -> Result<()> {
     let choices = [
         "Prepare map for authorized domain",
         "Import inventory metadata",
+        "Import from authorized HTTPS API",
         "Search inventory",
         "Browse aggregate facets",
         "Save a domain map",
@@ -569,6 +668,7 @@ fn menu_digital_map(app: &mut AppContext) -> Result<()> {
     match choose_action("Digital asset map", &choices)?.as_str() {
         "Prepare map for authorized domain" => prepare_domain_map(app),
         "Import inventory metadata" => menu_import(app),
+        "Import from authorized HTTPS API" => menu_import_url(app).await,
         "Search inventory" => menu_search(app),
         "Browse aggregate facets" => menu_facets(app),
         "Save a domain map" => menu_save_map(app),
@@ -578,12 +678,12 @@ fn menu_digital_map(app: &mut AppContext) -> Result<()> {
 
 fn prepare_domain_map(app: &mut AppContext) -> Result<()> {
     let target = ui::prompt_text("Domain or IP to map", None)?;
-    let domain = assetctl::scope::normalize_host(&target)?;
+    let domain = aegis::scope::normalize_host(&target)?;
     let existing = app
         .state()
         .scopes
         .iter()
-        .find(|scope| assetctl::scope::is_within_scope(&domain, &scope.target));
+        .find(|scope| aegis::scope::is_within_scope(&domain, &scope.target));
     let group = if let Some(scope) = existing {
         scope.group.clone()
     } else {
@@ -603,9 +703,7 @@ fn prepare_domain_map(app: &mut AppContext) -> Result<()> {
         .state()
         .assets
         .iter()
-        .filter(|asset| {
-            asset.group == group && assetctl::scope::is_within_scope(&asset.host, &domain)
-        })
+        .filter(|asset| asset.group == group && aegis::scope::is_within_scope(&asset.host, &domain))
         .collect::<Vec<_>>();
     println!(
         "\n{} {} — group: {}",
@@ -636,52 +734,163 @@ fn prepare_domain_map(app: &mut AppContext) -> Result<()> {
     Ok(())
 }
 
-fn menu_camera_inventory(app: &AppContext) -> Result<()> {
-    let groups = app
-        .state()
-        .assets
-        .iter()
-        .filter(|asset| asset.asset_type == "camera")
-        .map(|asset| asset.group.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let selected_group = if groups.is_empty() {
-        None
-    } else {
-        Some(ui::prompt_select(
-            "Select camera inventory group",
-            groups.iter().map(|group| (*group).to_owned()).collect(),
-        )?)
-    };
+fn menu_camera_inventory(app: &mut AppContext) -> Result<()> {
+    let action = choose_action(
+        "Camera inventory",
+        &[
+            "List camera records",
+            "Add camera record",
+            "Show camera details",
+            "Remove camera record",
+            "Back",
+        ],
+    )?;
+    match action.as_str() {
+        "List camera records" => {
+            let groups = app
+                .state()
+                .assets
+                .iter()
+                .filter(|asset| asset.asset_type == "camera")
+                .map(|asset| asset.group.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let selected_group = if groups.is_empty() {
+                None
+            } else {
+                Some(ui::prompt_select(
+                    "Select camera inventory group",
+                    groups.iter().map(|group| (*group).to_owned()).collect(),
+                )?)
+            };
+            let cameras = app
+                .state()
+                .assets
+                .iter()
+                .filter(|asset| {
+                    asset.asset_type == "camera"
+                        && selected_group
+                            .as_deref()
+                            .is_none_or(|group| asset.group == group)
+                })
+                .collect::<Vec<_>>();
+            print_camera_inventory(&cameras);
+            if cameras.is_empty() {
+                println!(
+                    "{}",
+                    "No camera records found. Add or import authorized inventory metadata."
+                        .yellow()
+                );
+            }
+        }
+        "Add camera record" => {
+            let host = ui::prompt_text("Camera domain or IP", None)?;
+            let label = ui::prompt_text("Display label", None)?;
+            let group = ui::prompt_text("Authorized inventory group", Some("default"))?;
+            let protocols = ui::prompt_text(
+                "Known protocol labels (comma-separated, optional)",
+                Some(""),
+            )?
+            .split(',')
+            .map(str::trim)
+            .filter(|protocol| !protocol.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+            app.add_camera_asset(&host, &label, &group, &protocols)?;
+            println!(
+                "{} Added camera record {} to {}.",
+                "✔".green().bold(),
+                host.bold(),
+                group.cyan()
+            );
+        }
+        "Show camera details" => menu_select_camera(app, false)?,
+        "Remove camera record" => menu_select_camera(app, true)?,
+        _ => {}
+    }
+    println!(
+        "{}",
+        "Camera protocols are inventory labels only; no discovery or live-feed access is performed."
+            .dimmed()
+    );
+    Ok(())
+}
+
+fn menu_select_camera(app: &mut AppContext, remove: bool) -> Result<()> {
     let cameras = app
         .state()
         .assets
         .iter()
-        .filter(|asset| {
-            asset.asset_type == "camera"
-                && selected_group
-                    .as_deref()
-                    .is_none_or(|group| asset.group == group)
-        })
+        .filter(|asset| asset.asset_type == "camera")
         .collect::<Vec<_>>();
-    print_camera_inventory(&cameras);
     if cameras.is_empty() {
-        println!(
-            "{}",
-            "No camera records found. Import inventory metadata for your authorized devices."
-                .yellow()
-        );
+        println!("{}", "No camera records are available.".yellow());
+        return Ok(());
     }
-    println!(
-        "{}",
-        "This view does not scan networks or open camera feeds.".dimmed()
-    );
+    let options = cameras
+        .iter()
+        .map(|camera| format!("[{}] {} — {}", camera.group, camera.host, camera.label))
+        .collect::<Vec<_>>();
+    let selected = ui::prompt_select("Select a camera record", options)?;
+    let camera = cameras
+        .into_iter()
+        .find(|camera| format!("[{}] {} — {}", camera.group, camera.host, camera.label) == selected)
+        .context("selected camera record was not found")?;
+    if remove {
+        let host = camera.host.clone();
+        let group = camera.group.clone();
+        if ui::prompt_confirm(&format!("Remove camera record {host}?"), false)? {
+            app.remove_asset(&host, &group)?;
+            println!("{} Removed {host}.", "✔".green().bold());
+        } else {
+            println!("{}", "No changes made.".dimmed());
+        }
+    } else {
+        print_camera_details(camera);
+    }
     Ok(())
 }
 
 fn menu_ssh_audit() -> Result<()> {
     let path = ui::prompt_text("Path to your local sshd_config file", None)?;
-    let findings = assetctl::modules::ssh_config::audit_sshd_config(PathBuf::from(path).as_path())?;
+    let findings = aegis::modules::ssh_config::audit_sshd_config(PathBuf::from(path).as_path())?;
     print_ssh_findings(&findings);
+    Ok(())
+}
+
+fn menu_transport_diagnostics() -> Result<()> {
+    let diagnostic = aegis::transport::diagnose_os_vpn(std::time::Duration::from_secs(3));
+    println!("{}", "NETWORK TRANSPORT STATUS".cyan().bold());
+    println!("  Mode: direct HTTPS using OS-managed network routing");
+    println!("  Tor: not supported; no proxy or anonymity claim");
+    println!(
+        "  VPN interface query: {}",
+        if diagnostic.supported {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
+    if diagnostic.likely_interfaces.is_empty() {
+        println!("  Likely VPN interfaces: none detected");
+    } else {
+        println!("  Likely VPN interfaces:");
+        for interface in diagnostic.likely_interfaces {
+            println!("    {interface}");
+        }
+    }
+    println!("  {}", diagnostic.note);
+    Ok(())
+}
+
+async fn menu_import_url(app: &mut AppContext) -> Result<()> {
+    let url = ui::prompt_text("HTTPS inventory API URL (host must be in scope)", None)?;
+    let group = ui::prompt_text("Authorized group", Some("default"))?;
+    let count = app.import_remote_inventory(&url, &group).await?;
+    println!(
+        "{} Imported {} record(s) from the authorized HTTPS inventory endpoint.",
+        "✔".green().bold(),
+        count
+    );
     Ok(())
 }
 
@@ -805,7 +1014,7 @@ fn menu_save_map(app: &AppContext) -> Result<()> {
     Ok(())
 }
 
-fn print_saved_map(map: &assetctl::storage::SavedMap) {
+fn print_saved_map(map: &aegis::storage::SavedMap) {
     println!(
         "\n{} {} — domain: {} — group: {} — saved: {}",
         "SAVED DIGITAL MAP".cyan().bold(),
@@ -824,20 +1033,32 @@ fn print_saved_map(map: &assetctl::storage::SavedMap) {
     }
 }
 
-fn print_camera_inventory(cameras: &[&assetctl::Asset]) {
+fn print_camera_inventory(cameras: &[&aegis::Asset]) {
     if cameras.is_empty() {
         println!("No camera records in local inventory.");
         return;
     }
     println!("\n{} ({})", "CAMERA INVENTORY".cyan().bold(), cameras.len());
     for camera in cameras {
-        print_asset_summary(camera);
-        if !camera.ip_addresses.is_empty() {
-            println!("    addresses: {}", camera.ip_addresses.join(", "));
-        }
-        if !camera.software_products.is_empty() {
-            println!("    products: {}", camera.software_products.join(", "));
-        }
+        print_camera_details(camera);
+    }
+}
+
+fn print_camera_details(camera: &aegis::Asset) {
+    println!(
+        "  {} {} — {}",
+        format!("[{}]", camera.group).dimmed(),
+        camera.host.cyan().bold(),
+        camera.label
+    );
+    if !camera.protocols.is_empty() {
+        println!("    protocol labels: {}", camera.protocols.join(", "));
+    }
+    if !camera.applications.is_empty() {
+        println!("    applications: {}", camera.applications.join(", "));
+    }
+    if !camera.software_products.is_empty() {
+        println!("    products: {}", camera.software_products.join(", "));
     }
 }
 
@@ -1155,21 +1376,32 @@ fn menu_audit(app: &AppContext) -> Result<()> {
 }
 
 fn menu_modules() -> Result<()> {
-    println!("{}", "AVAILABLE MODULES".cyan().bold());
-    println!("  scope       Explicitly authorized scope management");
-    println!("  inventory   Local inventory search and aggregate facets");
-    println!("  digital-map Local domain map built from imported records; save/open snapshots");
-    println!("  camera      Browse imported camera asset records; no network discovery");
-    println!("  ssh         Offline sshd_config posture review; no connection or exploitation");
+    println!("{}", "AEGIS CAPABILITY CATALOG".cyan().bold());
+    println!("\n{}", "ATTACK SURFACE INTELLIGENCE".magenta().bold());
+    println!("  scope       Authorized engagement scope management");
+    println!("  inventory   Local security asset search and aggregate facets");
+    println!("  digital-map Local domain map from imported records; save/open snapshots");
+    println!("\n{}", "INFRASTRUCTURE SECURITY".blue().bold());
+    println!("  ssh         Local sshd_config posture review");
+    println!("  transport   HTTPS import and OS VPN-interface diagnostics");
+    println!("\n{}", "OPERATIONS AND EVIDENCE".green().bold());
+    println!("  camera      IoT inventory records and protocol metadata");
+    println!("  import      Operator-provided local JSON inventory");
+    println!("  report      Local consistency findings and exports");
+    println!("  audit       Local activity history");
     for module in default_modules() {
         println!("  {:<12} {}", module.name(), module.description());
     }
-    println!("  import      Import operator-provided local JSON inventory");
-    println!("\nNo network scanning, device login, exploitation, or stealth actions.");
+    println!(
+        "\nAEGIS is designed for multiple security domains; each capability is listed as available only after implementation."
+    );
+    println!(
+        "Expansion domains: application security, cloud security, incident response, forensics, and detection engineering."
+    );
     Ok(())
 }
 
-fn print_asset_summary(asset: &assetctl::Asset) {
+fn print_asset_summary(asset: &aegis::Asset) {
     println!(
         "  {} {} {}",
         format!("[{}]", asset.group).dimmed(),

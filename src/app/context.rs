@@ -5,20 +5,32 @@ use crate::{
     modules::default_modules,
     scope::{is_within_scope, normalize_group, normalize_host},
     storage::{SavedMap, list_maps, load_map, load_state, save_map, save_state},
+    transport::{NetworkTransport, TransportConfig},
 };
 use anyhow::{Context, Result, bail};
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
 
 pub struct AppContext {
     data_dir: PathBuf,
     state: AppState,
+    transport: NetworkTransport,
 }
 
 impl AppContext {
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_timeout(data_dir, Duration::from_secs(20))
+    }
+
+    pub fn open_with_timeout(data_dir: impl Into<PathBuf>, timeout: Duration) -> Result<Self> {
         let data_dir = data_dir.into();
         let state = load_state(&data_dir)?;
-        Ok(Self { data_dir, state })
+        let transport = NetworkTransport::new(TransportConfig { timeout })
+            .context("failed to initialize HTTPS inventory transport")?;
+        Ok(Self {
+            data_dir,
+            state,
+            transport,
+        })
     }
 
     pub fn state(&self) -> &AppState {
@@ -105,6 +117,27 @@ impl AppContext {
         group: &str,
         asset_type: &str,
     ) -> Result<()> {
+        self.add_asset_with_metadata(input, label, group, asset_type, &[])
+    }
+
+    pub fn add_camera_asset(
+        &mut self,
+        input: &str,
+        label: &str,
+        group: &str,
+        protocols: &[String],
+    ) -> Result<()> {
+        self.add_asset_with_metadata(input, label, group, "camera", protocols)
+    }
+
+    fn add_asset_with_metadata(
+        &mut self,
+        input: &str,
+        label: &str,
+        group: &str,
+        asset_type: &str,
+        protocols: &[String],
+    ) -> Result<()> {
         let host = normalize_host(input)?;
         let group = normalize_group(group)?;
         let asset_type = asset_type.trim().to_ascii_lowercase();
@@ -141,6 +174,11 @@ impl AppContext {
             added_at: now()?,
             asset_type,
             group: group.clone(),
+            protocols: protocols
+                .iter()
+                .map(|protocol| protocol.trim().to_ascii_uppercase())
+                .filter(|protocol| !protocol.is_empty())
+                .collect(),
             ..Asset::default()
         });
         self.persist(next, "asset.add", &format!("{group}:{host}"))
@@ -224,6 +262,30 @@ impl AppContext {
         Ok(count)
     }
 
+    pub async fn import_remote_inventory(&mut self, endpoint: &str, group: &str) -> Result<usize> {
+        let url = reqwest::Url::parse(endpoint).context("invalid inventory API URL")?;
+        let hostname = url
+            .host_str()
+            .context("inventory API URL must include a hostname")?;
+        let hostname = normalize_host(hostname)?;
+        let group = normalize_group(group)?;
+        if !self
+            .state
+            .scopes
+            .iter()
+            .any(|scope| scope.group == group && is_within_scope(&hostname, &scope.target))
+        {
+            bail!("inventory API host {hostname} is outside the authorized {group} scope");
+        }
+
+        let assets = self
+            .transport
+            .fetch_inventory(&url)
+            .await
+            .context("failed to retrieve authorized inventory API data")?;
+        self.import_assets(&assets, &group)
+    }
+
     pub fn findings(&self) -> Result<Vec<crate::core::models::Finding>> {
         let mut findings = Vec::new();
         for module in default_modules() {
@@ -287,6 +349,28 @@ mod tests {
     }
 
     #[test]
+    fn camera_records_keep_protocols_as_inventory_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = AppContext::open(directory.path()).unwrap();
+        app.add_scope("example.com", "production").unwrap();
+        app.add_camera_asset(
+            "cam.example.com",
+            "Lobby camera",
+            "production",
+            &[" onvif ".into(), "RTSP".into()],
+        )
+        .unwrap();
+
+        let reopened = AppContext::open(directory.path()).unwrap();
+        let camera = &reopened.state().assets[0];
+        assert_eq!(camera.asset_type, "camera");
+        assert_eq!(
+            camera.protocols,
+            vec!["ONVIF".to_owned(), "RTSP".to_owned()]
+        );
+    }
+
+    #[test]
     fn integrity_check_reports_edited_out_of_scope_asset() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = AppContext::open(directory.path()).unwrap();
@@ -326,5 +410,29 @@ mod tests {
         assert!(app.state().assets.is_empty());
         assert_eq!(app.import_assets(&batch[..1], "production").unwrap(), 1);
         assert_eq!(app.state().assets[0].group, "production");
+    }
+
+    #[tokio::test]
+    async fn remote_import_rejects_hosts_outside_scope_before_connecting() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = AppContext::open(directory.path()).unwrap();
+        app.add_scope("example.com", "production").unwrap();
+        let result = app
+            .import_remote_inventory("https://192.0.2.1/assets", "production")
+            .await;
+        assert!(result.is_err());
+        assert!(app.state().assets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_import_rejects_non_https_before_connecting() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = AppContext::open(directory.path()).unwrap();
+        app.add_scope("example.com", "production").unwrap();
+        let result = app
+            .import_remote_inventory("http://api.example.com/assets", "production")
+            .await;
+        assert!(result.is_err());
+        assert!(app.state().assets.is_empty());
     }
 }
