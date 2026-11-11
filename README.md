@@ -27,6 +27,7 @@ cargo run -- scope add example.com --group production
 cargo run -- scope list
 cargo run -- groups
 cargo run -- asset add api.example.com "Public API" --group production
+cargo run -- asset add cam1.example.com "Lobby camera" --group production --asset-type camera
 cargo run -- import .\inventory.json --group production
 cargo run -- search --group production --asset-type host --application HTTP --port 443
 cargo run -- facets --group production
@@ -75,9 +76,9 @@ The local JSON import format is an array of manually collected inventory records
 
 `asset_type` is `host`, `certificate`, `web_property`, or `camera` (default: `host`). Every other metadata field is optional. `search` filters only locally stored records by text, group, asset type, application, protocol, service/web label, port, network, location, software vendor/product, certificate label, or issuer. `facets` shows per-field aggregate counts, and `asset show` displays one record's imported details. Import validates the entire file against the selected authorized group before saving any records; it does not fetch or discover metadata itself.
 
-The interactive menu groups workflows into **Digital asset map**, **Camera inventory**, **SSH configuration audit**, **Saved maps and archives**, **Scopes and groups**, **Inventory management**, and **Reports and local checks**. A domain map is assembled from previously imported inventory records under a confirmed authorized scope. Save it with `map save --domain example.com --group production`, then later find/open snapshots with `map list` and `map open`; snapshots are stored in the `archives` subfolder under the local data directory.
+The interactive menu groups workflows into **Digital asset map**, **Camera inventory**, **SSH configuration audit**, **Saved maps and archives**, **Scopes and groups**, **Inventory management**, and **Reports and local checks**. A domain map is assembled from previously imported inventory records under a confirmed authorized scope. Save it with `map save prod-snapshot --domain example.com --group production`, then later find/open snapshots with `map list` and `map open`; snapshots are stored in the `archives` subfolder under the local data directory and cannot overwrite an existing archive.
 
-Camera inventory accepts records with `"asset_type": "camera"` from a local authorized inventory export or the interactive Add Asset flow; it is an inventory browser, not a camera finder or live viewer. SSH audit reads a local `sshd_config` file and flags a small set of explicitly configured risky server settings. It does not connect to an IP, attempt authentication, or exploit SSH services.
+Camera inventory accepts records with `"asset_type": "camera"` from a local authorized inventory export or the interactive Add Asset flow; it is an inventory browser, not a camera finder or live viewer. SSH audit reads a local `sshd_config` file and flags a small set of explicitly configured risky server settings. It does not connect to an IP, attempt authentication, or exploit SSH services. This is a basic configuration review, not a complete evaluation of OpenSSH's `Include`, `Match`, and platform-specific effective settings.
 
 `check` runs only local consistency checks against the stored inventory. It makes no network connections and does not verify whether an asset is reachable or vulnerable.
 
